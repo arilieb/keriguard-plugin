@@ -70,6 +70,10 @@ class ViewKERIGuardDeviceDialog(LocksmithDialog):
         self.status = machine.get('status', '')
         self.expiration = machine.get('expiration', 0)
         self.tags = machine.get('tags', [])
+        
+        # Snapshot of the freshly-issued IP, set only while an interface-credential
+        # flow initiated by THIS dialog is in progress. Empty otherwise.
+        self._pending_address = ""
 
         # Create title content FIRST (before super().__init__)
         title_content_widget = QWidget()
@@ -443,42 +447,40 @@ class ViewKERIGuardDeviceDialog(LocksmithDialog):
 
                 raise RuntimeError(f"{error_msg} (HTTP {status})")
 
-            # Parse response to get the new IP address
+            # Parse response to get the new IP address (narrow try to parsing only)
             try:
                 response_data = response.json()
+                logger.info(f"Response data: {response_data}")
                 new_address = response_data.get("ip", "")
-                logger.info(f"IP address issued successfully: {new_address}")
-
-                # Update machine data
-                self.machine["address"] = new_address
-                self.address = new_address
-
-                team_server = await remoting.sync_team_server(self.app, self.aid)
-                if not team_server.get("success", False):
-                    raise RuntimeError("Failed to sync team server")
-
-                await self._issue_interface_credential()
-
-                # Refresh the view to show updated data
-                await self._refresh_view()
-
-                # Call the on_refresh callback if provided to update the list
-                if self.on_refresh:
-                    self.on_refresh()
-
             except Exception as e:
-                logger.warning(f"IP issued but failed to parse response: {e}")
-                # Still refresh the view even if we couldn't parse the response
-                await self._refresh_view()
-                if self.on_refresh:
-                    self.on_refresh()
+                raise RuntimeError(f"Failed to parse IP allocation response: {e}")
+
+            if not new_address:
+                raise RuntimeError(
+                    f"Server returned no IP address (HTTP {response.status_code}, body={response_data!r})"
+                )
+
+            logger.info(f"IP address issued successfully: {new_address}")
+
+            # Update machine data
+            self.machine["address"] = new_address
+            self.address = new_address
+
+            team_server = await remoting.sync_team_server(self.app, self.aid)
+            if not team_server.get("success", False):
+                raise RuntimeError("Failed to sync team server")
+
+            # Opens the auth dialog; issuance continues asynchronously in
+            # _on_auth_codes_entered once the user submits their codes.
+            await self._issue_interface_credential()
 
         except Exception as e:
             import traceback
             traceback.print_exc()
             logger.error(f"Failed to issue IP address: {e}")
             self._display_error(str(e))
-            # Re-enable button on error
+            # Abandon any in-progress flow and re-enable the button on error
+            self._pending_address = ""
             self.issue_ip_button.setEnabled(True)
             self.issue_ip_button.setText("Issue IP Address")
 
@@ -509,6 +511,10 @@ class ViewKERIGuardDeviceDialog(LocksmithDialog):
         issuer_aid = settings.issuer_aid
         hab = hby.habs.get(issuer_aid)
 
+        # Snapshot the address NOW so a later refresh cannot clobber it, and use
+        # it as a flag that THIS dialog initiated the interface-credential flow.
+        self._pending_address = self.address
+
         auth_dialog = WitnessAuthenticationDialog(
             app=self.app,
             hab=hab,
@@ -529,6 +535,19 @@ class ViewKERIGuardDeviceDialog(LocksmithDialog):
             data: Dictionary containing 'codes' key with list of "witness_id:passcode" strings
         """
         try:
+            # Only act if THIS dialog initiated an interface-credential flow.
+            # The signal is app-wide, so other dialogs / purposes may emit it.
+            if not getattr(self, "_pending_address", ""):
+                return
+
+            # Consume the snapshot immediately so a re-entrant emission of the
+            # signal cannot trigger a second issuance.
+            address = self._pending_address
+            self._pending_address = ""
+
+            if not address.strip():
+                raise RuntimeError("No IP address available to build interface credential")
+
             hby = self.app.vault.hby
             rgy = self.app.vault.rgy
             team = self.app.vault.plugin_state.get("keriguard", {}).get("team")
@@ -552,8 +571,9 @@ class ViewKERIGuardDeviceDialog(LocksmithDialog):
 
             interface_config = {
                 "listenPort": 51820,
-                "address": [f"{self.address.strip()}/32"],
+                "address": [f"{address.strip()}/32"],
             }
+            logger.info(f"Building interface_config with address={address!r}")
 
             interface_metadata = {
                 "interfaceName": "wg0",
@@ -598,7 +618,7 @@ class ViewKERIGuardDeviceDialog(LocksmithDialog):
 
             publish_mode = settings.publish_mode if settings else "registrar"  # type: ignore
 
-            if publish_mode == "serviceprovider" and essr:
+            if publish_mode == "healthKERI" and essr:
                 await remoting.send_key_state_update(self.app, hab.pre)
                 await push_credential_via_essr(grant_bytes, essr, creder, introduction_bytes)
                 account = self.app.vault.plugin_state.get("keriguard", {}).get("account")
@@ -620,6 +640,11 @@ class ViewKERIGuardDeviceDialog(LocksmithDialog):
             self.show_success(
                 f"Interface credential issued successfully. SAID: {creder.said}"
             )
+
+            # Refresh only AFTER the credential has actually been issued.
+            await self._refresh_view()
+            if self.on_refresh:
+                self.on_refresh()
 
         except Exception as exc:
             logger.exception(f"IssueInterfaceCredentialPage: issuance failed: {exc}")
